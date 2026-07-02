@@ -13,6 +13,7 @@
 // stdlib-only. 포트(interface) 뒤에 실제 구현(OPA/Vault/Executor)이 꽂힌다.
 // v0.1 = 흐름 골격 + mock 어댑터. solver·집행 hot path는 자리만.
 // v0.2 = 게이트3-0 구조 하드레일 추가: 개발엔진↛인프라 (D52 확정, 66 v0.3 소급 C).
+// v0.3 = 게이트4 Planner mock → Solver 격상 (목적함수=인프라효율/SLA·주권·격리 하드제약, 50 §1·52).
 
 package main
 
@@ -294,6 +295,8 @@ func (mockPolicy) Evaluate(req ChangeRequest) PolicyDecision {
 	return PolicyDecision{Allowed: true}
 }
 
+// mockPlanner = v0.1 위험도 분류 mock. v0.2에서 Solver(solver.go)로 대체됨.
+// 계보 참조용으로 남김 — 실제 wiring 은 NewSolver(mockCandidateGen{}).
 type mockPlanner struct{}
 
 func (mockPlanner) Plan(req ChangeRequest, _ PolicyDecision) (Plan, error) {
@@ -352,7 +355,7 @@ func join(ss []string) string {
 // ── 관통 시연 (도는지 검증) ─────────────────────────────────────────
 
 func main() {
-	p := &Pipeline{Auth: mockAuth{}, Policy: mockPolicy{}, Plan: mockPlanner{}, Exec: mockExecutor{}}
+	p := &Pipeline{Auth: mockAuth{}, Policy: mockPolicy{}, Plan: NewSolver(mockCandidateGen{}), Exec: mockExecutor{}}
 	ctx := context.Background()
 
 	cases := []ChangeRequest{
