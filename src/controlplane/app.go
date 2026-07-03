@@ -17,10 +17,35 @@ type App struct {
 	auth     AuthPort
 	kms      KmsPort
 	secret   SecretPort
-	payment  PaymentPort
+	payment  CustomerPort // L0 고객 등록. 구독/인보이스/환불은 별도 포트 어댑터.
 	warmpool *WarmPool
 	registry *RoutingRegistry
+	ledger   *Ledger
 	region   string
+
+	// 결제 확장 포트
+	pgRouter  PGRouterPort
+	operator  OperatorPort
+	consent   ConsentPort
+
+	// 알림 포트
+	notif     NotificationPort
+
+	// 인증 확장 포트
+	pkce      OAuth2PKCEPort
+	device    DeviceFlowPort
+	apiKey    APIKeyPort
+
+	// HA 포트
+	heartbeat HeartbeatPort
+	failover  FailoverPort
+	backup    BackupPort
+
+	// 자동화 봇
+	retryBot      *PaymentRetryBot
+	slaBot        *SLACompensationBot
+	settleBot     *SettlementBot
+	failoverBot   *FailoverBot
 }
 
 // 기본 정책 = 부하 비례(추천). 갈아끼우려면 NewAppWithPolicy.
@@ -33,13 +58,43 @@ func NewAppWithPolicy(policy WarmPoolPolicy) *App {
 	a := &App{
 		store:   NewStore(),
 		storage: &MockStorage{region: region, coldBootMS: 150}, // 콜드부팅 시뮬 150ms
-		auth:    &MockAuth{},
+		auth:    NewMockAuth(), // [sovereign_core] HMAC-SHA256 서명 기반 (T9-A 위조 토큰 결함 수정)
 		kms:     &MockKms{},
 		secret:  &MockSecret{},
 		payment: &MockPayment{},
+		ledger:  NewLedger(),
 		region:  region,
 	}
 	a.warmpool = NewWarmPool(a.storage, region, policy)
+
+	// 이벤트 버스 초기화 (인메모리).
+	bus := NewInMemoryEventBus()
+
+	// 결제 확장 포트 초기화.
+	a.pgRouter = NewPGRouter(a.store)
+	a.notif = NewNotificationAdapter(a.store, bus)
+	a.operator = NewOperatorAdapter(bus)
+	a.consent = NewConsentAdapter(bus, a.notif)
+
+	// 인증 확장 포트 초기화.
+	a.pkce = NewOAuth2PKCEAdapter()
+	a.device = NewDeviceFlowAdapter()
+	a.apiKey = NewAPIKeyAdapter()
+
+	// HA 포트 초기화.
+	a.heartbeat = NewHeartbeatAdapter(bus)
+	a.failover = NewFailoverAdapter(bus)
+	a.backup = NewBackupAdapter(bus)
+
+	// 자동화 봇 초기화.
+	var paymentFailure PaymentFailurePort
+	if mp, ok := a.payment.(*MockPayment); ok {
+		paymentFailure = mp
+	}
+	a.retryBot = NewPaymentRetryBot(paymentFailure, a.notif, bus)
+	a.slaBot = NewSLACompensationBot(a.notif, bus)
+	a.settleBot = NewSettlementBot(&MockInvoice{}, a.notif, bus, a.store)
+	a.failoverBot = NewFailoverBot(a.heartbeat, a.failover, a.backup, a.notif, bus)
 
 	// WakeHook = scale-to-zero 깨우기 → 웜풀에서 확보 + 브랜치 부착.
 	a.registry = NewRoutingRegistry(func(endpointID string) (string, int64, error) {
@@ -75,12 +130,14 @@ func (a *App) Signup(ctx context.Context, name, ownerUserID string) (*Org, strin
 		return nil, "", fmt.Errorf("billing: %w", err)
 	}
 	org.BillingID = billingID
-	a.store.put(org)
-	a.store.addMembership(Membership{OrgID: org.ID, UserID: ownerUserID, Role: "owner"})
+	// 토큰을 먼저 발급받고, 성공한 뒤에만 store 에 커밋한다.
+	// (이전엔 store.put/addMembership 후 IssueToken 실패 시 좀비 org/membership 잔존 = T5 결함)
 	token, err := a.auth.IssueToken(ctx, org.ID, ownerUserID, "owner")
 	if err != nil {
 		return nil, "", fmt.Errorf("token: %w", err)
 	}
+	a.store.put(org)
+	a.store.addMembership(Membership{OrgID: org.ID, UserID: ownerUserID, Role: "owner"})
 	return org, token, nil
 }
 
@@ -200,6 +257,19 @@ func (a *App) ResolveConnection(att ConnAttempt) (endpointID, backendAddr string
 }
 
 func (a *App) Usage(orgID string) map[string]float64 { return a.store.usageRollup(orgID) }
+
+// waitIdemp — 멱등 예약(sentinel)가 확정 op.ID 로 바뀔 때까지 짧게 대기.
+// 동시 요청 중 선점 실패자가 확정 id 를 받아 replay 하기 위함. 미확정 시 "".
+func (a *App) waitIdemp(key string, timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if id, ok := a.store.idempResolve(key); ok {
+			return id
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return ""
+}
 
 // 폴링 헬퍼: op 완료까지 대기. 값 복사 반환(레이스 없음).
 func (a *App) waitOp(orgID, opID string, timeout time.Duration) (Operation, error) {

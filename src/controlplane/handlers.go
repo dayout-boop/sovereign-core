@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -75,14 +76,28 @@ func (s *Server) handleJWKS(w http.ResponseWriter, r *http.Request) {
 }
 
 // 멱등성 체크 → 비동기 op 시작 → 202 + operation_id.
+// 원자적 예약(idempReserve)으로 TOCTOU 이중생성 제거:
+//   - reserved=true 인 단 하나의 요청만 op 를 생성하고 idempCommit 으로 확정.
+//   - 나머지 동시 요청(reserved=false)은 확정된 op.ID 를 짧게 폴링해 replay 로 반환.
 func (s *Server) startOp(w http.ResponseWriter, r *http.Request, c Claims, make func(context.Context) *Operation) {
 	key := r.Header.Get("Idempotency-Key")
-	if prev, ok := s.app.store.idempLookup(key); ok {
-		writeJSON(w, 202, map[string]string{"operation_id": prev, "idempotent_replay": "true"})
+	existing, reserved := s.app.store.idempReserve(key)
+	if !reserved {
+		// 이미 다른 요청이 선점함. 확정 id 가 나올 때까지 짧게 대기 후 replay.
+		id := existing
+		if id == "" {
+			id = s.app.waitIdemp(key, 2*time.Second)
+		}
+		if id == "" {
+			writeJSON(w, 503, map[string]string{"error": "idempotent operation pending, retry"})
+			return
+		}
+		writeJSON(w, 202, map[string]string{"operation_id": id, "idempotent_replay": "true"})
 		return
 	}
+	// 이 요청이 유일한 선점자. 실제 op 생성 후 확정.
 	op := make(context.WithValue(r.Context(), claimsKey, c))
-	s.app.store.idempStore(key, op.ID)
+	s.app.store.idempCommit(key, op.ID)
 	w.Header().Set("Location", "/v1/operations/"+op.ID)
 	writeJSON(w, 202, map[string]string{"operation_id": op.ID})
 }
