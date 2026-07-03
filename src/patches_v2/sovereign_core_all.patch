@@ -1,0 +1,723 @@
+--- a/storage_controller/src/reconciler.rs
++++ b/storage_controller/src/reconciler.rs
+@@ -28,6 +28,13 @@
+ 
+ const DEFAULT_HEATMAP_PERIOD: Duration = Duration::from_secs(60);
+ 
++// [sovereign_core] Adaptive LSN-catchup polling bounds for live-migration cutover.
++// Upstream Neon uses a hard-coded 500ms poll. We poll tight first, then back off
++// exponentially up to a ceiling, so the common "already caught up" case exits fast
++// while a slow catch-up does not spin. See await_lsn() below.
++const AWAIT_LSN_POLL_MIN: Duration = Duration::from_millis(50);
++const AWAIT_LSN_POLL_MAX: Duration = Duration::from_millis(500);
++
+ /// Object with the lifetime of the background reconcile task that is created
+ /// for tenants which have a difference between their intent and observed states.
+ pub(super) struct Reconciler {
+@@ -581,19 +588,35 @@
+                 }
+                 Err(e) => {
+                     tracing::info!("🕑 Can't trigger LSN wait on {node} yet, waiting ({e})",);
+-                    tokio::time::sleep(Duration::from_millis(500)).await;
++                    // [sovereign_core] retry the trigger promptly at the adaptive minimum
++                    // instead of a flat 500ms.
++                    tokio::time::sleep(AWAIT_LSN_POLL_MIN).await;
+                     continue;
+                 }
+             }
+         }
+ 
+         // Poll the LSNs until they catch up
++        //
++        // [sovereign_core] Adaptive cutover polling.
++        // Upstream Neon polls at a fixed 500ms interval, which can add up to ~500ms of
++        // idle wait to the live-migration cutover blackout even after the destination
++        // has already caught up. Since cutover is a rare event, polling more
++        // aggressively costs only a negligible number of extra HTTP requests while
++        // cutting the p50 blackout roughly in half (validated in
++        // latency_tradeoff_sim.py: 418.8ms -> 174.6ms p50). We start tight
++        // (AWAIT_LSN_POLL_MIN) and back off exponentially up to AWAIT_LSN_POLL_MAX so
++        // a genuinely slow catch-up does not hammer the pageserver. The correctness
++        // ordering (stale -> generation bump -> attach -> await_lsn -> notify) is
++        // untouched; only the poll cadence changes.
++        let mut poll_backoff = AWAIT_LSN_POLL_MIN;
+         loop {
+             let latest = match self.get_lsns(tenant_shard_id, node).await {
+                 Ok(l) => l,
+                 Err(e) => {
+                     tracing::info!("🕑 Can't get LSNs on node {node} yet, waiting ({e})",);
+-                    tokio::time::sleep(Duration::from_millis(500)).await;
++                    tokio::time::sleep(poll_backoff).await;
++                    poll_backoff = (poll_backoff * 2).min(AWAIT_LSN_POLL_MAX);
+                     continue;
+                 }
+             };
+@@ -617,7 +640,8 @@
+                 tracing::info!("✅ LSN caught up.  Proceeding...");
+                 break;
+             } else {
+-                tokio::time::sleep(Duration::from_millis(500)).await;
++                tokio::time::sleep(poll_backoff).await;
++                poll_backoff = (poll_backoff * 2).min(AWAIT_LSN_POLL_MAX);
+             }
+         }
+ 
+--- a/storage_controller/src/heartbeater.rs
++++ b/storage_controller/src/heartbeater.rs
+@@ -17,14 +17,26 @@
+ use utils::logging::SecretString;
+ 
+ use crate::node::Node;
++use crate::phi_accrual_detector::{DEFAULT_PHI_THRESHOLD, PhiAccrualDetector};
+ use crate::safekeeper::Safekeeper;
+ 
++// [sovereign_core] Suspicion threshold at which a node is declared Offline by the
++// adaptive phi-accrual detector. See phi_accrual_detector.rs for the model.
++const PHI_THRESHOLD: f64 = DEFAULT_PHI_THRESHOLD;
++
+ struct HeartbeaterTask<Server, State> {
+     receiver: tokio::sync::mpsc::UnboundedReceiver<HeartbeatRequest<Server, State>>,
+     cancel: CancellationToken,
+ 
+     state: HashMap<NodeId, State>,
+ 
++    // [sovereign_core] Per-node adaptive failure detectors. These learn each
++    // node's heartbeat rhythm and replace the single fixed `max_offline_interval`
++    // comparison when deciding to mark a node Offline. `max_offline_interval` is
++    // retained and passed to each detector as the cold-start fallback grace
++    // period, so behaviour before warm-up is identical to upstream.
++    detectors: HashMap<NodeId, PhiAccrualDetector>,
++
+     max_offline_interval: Duration,
+     max_warming_up_interval: Duration,
+     http_client: reqwest::Client,
+@@ -34,6 +46,10 @@
+ #[derive(Debug, Clone)]
+ pub(crate) enum PageserverState {
+     Available {
++        // [sovereign_core] Retained for observability/debug output. Failure
++        // detection no longer reads this directly; the adaptive phi-accrual
++        // detector (see phi_accrual_detector.rs) tracks heartbeat timing instead.
++        #[allow(dead_code)]
+         last_seen_at: Instant,
+         utilization: PageserverUtilization,
+     },
+@@ -132,6 +148,8 @@
+             receiver,
+             cancel,
+             state: HashMap::new(),
++            // [sovereign_core] detectors are created lazily per node on first heartbeat.
++            detectors: HashMap::new(),
+             max_offline_interval,
+             max_warming_up_interval,
+             http_client,
+@@ -271,14 +289,33 @@
+         let now = Instant::now();
+         for (node_id, ps_state) in new_state.iter_mut() {
+             use std::collections::hash_map::Entry::*;
++
++            // [sovereign_core] Feed the adaptive detector for this node. A
++            // successful heartbeat this round records an inter-arrival sample so
++            // the detector learns the node's rhythm; the detector is created
++            // lazily with `max_offline_interval` as its cold-start fallback grace.
++            let detector = self
++                .detectors
++                .entry(*node_id)
++                .or_insert_with(|| PhiAccrualDetector::new(self.max_offline_interval));
++            if let PageserverState::Available { .. } = ps_state {
++                detector.record_heartbeat(now);
++            }
++
+             let entry = self.state.entry(*node_id);
+ 
+             let mut needs_update = false;
+             match entry {
+                 Occupied(ref occ) => match (occ.get(), &ps_state) {
+                     (PageserverState::Offline, PageserverState::Offline) => {}
+-                    (PageserverState::Available { last_seen_at, .. }, PageserverState::Offline) => {
+-                        if now - *last_seen_at >= self.max_offline_interval {
++                    (PageserverState::Available { .. }, PageserverState::Offline) => {
++                        // [sovereign_core] Replace the fixed `max_offline_interval`
++                        // grace with the adaptive phi-accrual suspicion level. The
++                        // node is declared Offline only once suspicion crosses
++                        // PHI_THRESHOLD. Before enough samples are learned the
++                        // detector falls back to the old fixed grace, so early
++                        // behaviour is unchanged.
++                        if !detector.is_available(now, PHI_THRESHOLD) {
+                             deltas.push((*node_id, ps_state.clone()));
+                             needs_update = true;
+                         }
+@@ -313,6 +350,10 @@
+             }
+         }
+ 
++        // [sovereign_core] Drop detectors for nodes not present this round so the
++        // per-node detector map cannot grow unbounded as nodes are decommissioned.
++        self.detectors.retain(|id, _| new_state.contains_key(id));
++
+         Ok(AvailablityDeltas(deltas))
+     }
+ }
+@@ -409,14 +450,26 @@
+         let now = Instant::now();
+         for (node_id, sk_state) in new_state.iter_mut() {
+             use std::collections::hash_map::Entry::*;
++
++            // [sovereign_core] Safekeepers use the same adaptive detector as
++            // pageservers so quorum-affecting failures are surfaced promptly on
++            // steady links while jittery links keep their extra slack.
++            let detector = self
++                .detectors
++                .entry(*node_id)
++                .or_insert_with(|| PhiAccrualDetector::new(self.max_offline_interval));
++            if let SafekeeperState::Available { .. } = sk_state {
++                detector.record_heartbeat(now);
++            }
++
+             let entry = self.state.entry(*node_id);
+ 
+             let mut needs_update = false;
+             match entry {
+                 Occupied(ref occ) => match (occ.get(), &sk_state) {
+                     (SafekeeperState::Offline, SafekeeperState::Offline) => {}
+-                    (SafekeeperState::Available { last_seen_at, .. }, SafekeeperState::Offline) => {
+-                        if now - *last_seen_at >= self.max_offline_interval {
++                    (SafekeeperState::Available { .. }, SafekeeperState::Offline) => {
++                        if !detector.is_available(now, PHI_THRESHOLD) {
+                             deltas.push((*node_id, sk_state.clone()));
+                             needs_update = true;
+                         }
+@@ -443,6 +496,9 @@
+             }
+         }
+ 
++        // [sovereign_core] Same detector cleanup as the pageserver path.
++        self.detectors.retain(|id, _| new_state.contains_key(id));
++
+         Ok(AvailablityDeltas(deltas))
+     }
+ }
+--- a/storage_controller/src/lib.rs
++++ b/storage_controller/src/lib.rs
+@@ -17,6 +17,7 @@
+ mod pageserver_client;
+ mod peer_client;
+ pub mod persistence;
++mod phi_accrual_detector;
+ mod reconciler;
+ mod safekeeper;
+ mod safekeeper_client;
+--- a/storage_controller/src/service.rs
++++ b/storage_controller/src/service.rs
+@@ -448,6 +448,15 @@
+     /// 0 or 1 disables initial splits. Has no effect if initial_split_threshold is disabled.
+     pub initial_split_shards: u8,
+ 
++    /// [sovereign_core] Per-shard write-load threshold in requests/sec that triggers a
++    /// load-based autosplit. Upstream Neon only splits on logical size, so a tenant with
++    /// modest data but very high write QPS stays pinned to one shard and saturates a single
++    /// pageserver. When a shard's observed write load exceeds this value the tenant is split
++    /// even if it is below `split_threshold` by size, up to `max_split_shards`.
++    ///
++    /// None or 0 disables load-based splits, preserving upstream behaviour exactly.
++    pub load_split_threshold: Option<u64>,
++
+     // TODO: make this cfg(feature  = "testing")
+     pub neon_local_repo_dir: Option<PathBuf>,
+ 
+@@ -666,6 +675,16 @@
+     initial_split_threshold: u64,
+     /// Number of shards for initial splits. 0 or 1 disables initial splits.
+     initial_split_shards: u8,
++    /// [sovereign_core] Observed write load (requests/sec) on the tenant's
++    /// hottest shard. Upstream Neon splits purely on logical size, which leaves
++    /// small-but-hot tenants (high QPS, low bytes) stuck on a single shard and
++    /// bottlenecked. Zero disables load-based splits and preserves upstream
++    /// behaviour exactly.
++    max_shard_wps: u64,
++    /// [sovereign_core] Per-shard write-load threshold in requests/sec. When a
++    /// shard's observed load exceeds this value the tenant is split even if it
++    /// is below `split_threshold` by size. Zero disables load-based splits.
++    load_split_threshold: u64,
+ }
+ 
+ struct ShardUpdate {
+@@ -9226,7 +9245,9 @@
+ 
+         // If no split_threshold nor initial_split_threshold, disable autosplits.
+         let split_threshold = self.config.split_threshold.unwrap_or(0);
+-        if split_threshold == 0 && initial_split_threshold == 0 {
++        // [sovereign_core] Load-based split threshold (write requests/sec per shard).
++        let load_split_threshold = self.config.load_split_threshold.unwrap_or(0);
++        if split_threshold == 0 && initial_split_threshold == 0 && load_split_threshold == 0 {
+             return;
+         }
+ 
+@@ -9275,6 +9296,23 @@
+             candidates.extend(size_candidates);
+         }
+ 
++        // [sovereign_core] Load-based splits: fetch tenants whose hottest shard exceeds the
++        // write-load threshold. These may be well below the size thresholds above, so upstream
++        // Neon would never surface them; we order by write load and let compute_split_shards
++        // decide the final target. The pageserver reports write_load_wps per shard; shards on
++        // older pageservers report 0 and are naturally excluded.
++        if load_split_threshold > 0 {
++            let load_candidates = self
++                .get_top_tenant_shards(&TopTenantShardsRequest {
++                    order_by: TenantSorting::WriteLoad,
++                    limit: 10,
++                    where_shards_lt: Some(ShardCount(max_split_shards)),
++                    where_gt: Some(load_split_threshold),
++                })
++                .await;
++            candidates.extend(load_candidates);
++        }
++
+         // Filter out tenants in a prohibiting scheduling modes
+         // and tenants with an ongoing import.
+         //
+@@ -9309,6 +9347,9 @@
+                     max_split_shards,
+                     initial_split_threshold,
+                     initial_split_shards,
++                    // [sovereign_core] Feed observed write load into the split decision.
++                    max_shard_wps: candidate.write_load_wps,
++                    load_split_threshold,
+                 });
+                 new_shard_count.map(|shards| (candidate, shards.count()))
+             })
+@@ -9373,6 +9414,8 @@
+             max_split_shards,
+             initial_split_threshold,
+             initial_split_shards,
++            max_shard_wps,
++            load_split_threshold,
+         } = inputs;
+ 
+         let mut new_shard_count: u8 = shard_count.count();
+@@ -9403,6 +9446,24 @@
+             new_shard_count = new_shard_count.max(initial_split_shards);
+         }
+ 
++        // [sovereign_core] Load-based splits. Ensures max_shard_wps / new_shard_count
++        // <= load_split_threshold, using power-of-two shard counts, mirroring the
++        // size-based rule above. This catches small-but-hot tenants that upstream
++        // Neon would never split because they are below split_threshold by size.
++        // Both max_shard_wps and load_split_threshold default to 0, in which case
++        // this branch is inert and behaviour is identical to upstream.
++        if load_split_threshold > 0
++            && max_shard_wps.div_ceil(load_split_threshold) > shard_count.count() as u64
++        {
++            let load_shard_count: u8 = max_shard_wps
++                .div_ceil(load_split_threshold)
++                .checked_next_power_of_two()
++                .unwrap_or(u8::MAX as u64)
++                .try_into()
++                .unwrap_or(u8::MAX);
++            new_shard_count = new_shard_count.max(load_shard_count);
++        }
++
+         // Clamp to max shards.
+         new_shard_count = new_shard_count.min(max_split_shards);
+ 
+@@ -10236,6 +10297,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(8))
+         );
+@@ -10249,6 +10312,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None,
+         );
+@@ -10260,6 +10325,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None,
+         );
+@@ -10271,6 +10338,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(4)),
+         );
+@@ -10284,6 +10353,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(16))
+         );
+@@ -10297,6 +10368,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None
+         );
+@@ -10309,6 +10382,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None
+         );
+@@ -10323,6 +10398,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(8))
+         );
+@@ -10337,6 +10414,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None
+         );
+@@ -10348,6 +10427,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None
+         );
+@@ -10359,6 +10440,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 0,
+                 initial_split_shards: 0,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(4))
+         );
+@@ -10372,6 +10455,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(4))
+         );
+@@ -10385,6 +10470,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(4))
+         );
+@@ -10398,6 +10485,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None,
+         );
+@@ -10409,6 +10498,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None,
+         );
+@@ -10420,6 +10511,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(4))
+         );
+@@ -10434,6 +10527,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None,
+         );
+@@ -10447,6 +10542,8 @@
+                 max_split_shards: 3,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(3)),
+         );
+@@ -10460,6 +10557,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(4)),
+         );
+@@ -10471,6 +10570,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 4,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(8)),
+         );
+@@ -10484,6 +10585,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 8,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(4)),
+         );
+@@ -10498,6 +10601,8 @@
+                 max_split_shards: 16,
+                 initial_split_threshold: 8,
+                 initial_split_shards: 8,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(8)),
+         );
+@@ -10513,6 +10618,8 @@
+                 max_split_shards: 8,
+                 initial_split_threshold: 64,
+                 initial_split_shards: 8,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             Some(ShardCount(8)),
+         );
+@@ -10525,6 +10632,8 @@
+                 max_split_shards: 8,
+                 initial_split_threshold: 64,
+                 initial_split_shards: 8,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
+             }),
+             None,
+         );
+@@ -10537,8 +10646,89 @@
+                 max_split_shards: 8,
+                 initial_split_threshold: 64,
+                 initial_split_shards: 8,
++                max_shard_wps: 0,
++                load_split_threshold: 0,
++            }),
++            Some(ShardCount(4)),
++        );
++
++        // [sovereign_core] Load-based split: a tiny tenant (below split_threshold by size)
++        // that is very hot on writes must still split. 3000 wps / 1000 wps threshold = 3,
++        // rounded up to the next power of two = 4 shards.
++        assert_eq!(
++            Service::compute_split_shards(ShardSplitInputs {
++                shard_count: ShardCount(1),
++                max_logical_size: 1,
++                split_threshold: 64,
++                max_split_shards: 16,
++                initial_split_threshold: 0,
++                initial_split_shards: 0,
++                max_shard_wps: 3000,
++                load_split_threshold: 1000,
+             }),
+             Some(ShardCount(4)),
+         );
++
++        // [sovereign_core] Load-based split is inert when load is at or below threshold.
++        assert_eq!(
++            Service::compute_split_shards(ShardSplitInputs {
++                shard_count: ShardCount(1),
++                max_logical_size: 1,
++                split_threshold: 64,
++                max_split_shards: 16,
++                initial_split_threshold: 0,
++                initial_split_shards: 0,
++                max_shard_wps: 1000,
++                load_split_threshold: 1000,
++            }),
++            None,
++        );
++
++        // [sovereign_core] With load_split_threshold = 0, load is ignored entirely and
++        // behaviour is identical to upstream (no split for a tiny, hot tenant).
++        assert_eq!(
++            Service::compute_split_shards(ShardSplitInputs {
++                shard_count: ShardCount(1),
++                max_logical_size: 1,
++                split_threshold: 64,
++                max_split_shards: 16,
++                initial_split_threshold: 0,
++                initial_split_shards: 0,
++                max_shard_wps: 1_000_000,
++                load_split_threshold: 0,
++            }),
++            None,
++        );
++
++        // [sovereign_core] Load-based split is clamped to max_split_shards.
++        assert_eq!(
++            Service::compute_split_shards(ShardSplitInputs {
++                shard_count: ShardCount(1),
++                max_logical_size: 1,
++                split_threshold: 64,
++                max_split_shards: 8,
++                initial_split_threshold: 0,
++                initial_split_shards: 0,
++                max_shard_wps: 100_000,
++                load_split_threshold: 1000,
++            }),
++            Some(ShardCount(8)),
++        );
++
++        // [sovereign_core] Size-based and load-based splits take the larger target: a tenant
++        // that warrants 4 shards by size but 8 by load ends up at 8.
++        assert_eq!(
++            Service::compute_split_shards(ShardSplitInputs {
++                shard_count: ShardCount(1),
++                max_logical_size: 200,
++                split_threshold: 64,
++                max_split_shards: 16,
++                initial_split_threshold: 0,
++                initial_split_shards: 0,
++                max_shard_wps: 8000,
++                load_split_threshold: 1000,
++            }),
++            Some(ShardCount(8)),
++        );
+     }
+ }
+--- a/storage_controller/src/main.rs
++++ b/storage_controller/src/main.rs
+@@ -128,6 +128,11 @@
+     #[arg(long, default_value = "2")]
+     initial_split_shards: u8,
+ 
++    /// [sovereign_core] Per-shard write-load threshold (requests/sec) that triggers a
++    /// load-based autosplit. 0 or unset disables load-based splits (upstream behaviour).
++    #[arg(long)]
++    load_split_threshold: Option<u64>,
++
+     /// Maximum number of normal-priority reconcilers that may run in parallel
+     #[arg(long)]
+     reconciler_concurrency: Option<usize>,
+@@ -457,6 +462,7 @@
+         max_split_shards: args.max_split_shards,
+         initial_split_threshold: args.initial_split_threshold,
+         initial_split_shards: args.initial_split_shards,
++        load_split_threshold: args.load_split_threshold,
+         neon_local_repo_dir: args.neon_local_repo_dir,
+         max_secondary_lag_bytes: args.max_secondary_lag_bytes,
+         heartbeat_interval: args
+--- a/libs/pageserver_api/src/models.rs
++++ b/libs/pageserver_api/src/models.rs
+@@ -1815,6 +1815,9 @@
+     /// The logical size of the largest timeline within a _tenant_ (not shard), divided by number of
+     /// shards. Only tracked on shard 0, and estimates the per-shard logical size.
+     MaxLogicalSizePerShard,
++    /// [sovereign_core] Observed write load (requests/sec) on a shard. Used to surface
++    /// small-but-hot tenants for load-based autosplitting.
++    WriteLoad,
+ }
+ 
+ impl Default for TenantSorting {
+@@ -1858,6 +1861,13 @@
+     /// shards. This is only tracked on shard 0, and is only an estimate as we divide it evenly by
+     /// shard count, rounded up.
+     pub max_logical_size_per_shard: u64,
++
++    /// [sovereign_core] Observed write load on this shard in requests/sec, used to drive
++    /// load-based autosplits for small-but-hot tenants. `#[serde(default)]` keeps the wire
++    /// format backward compatible: pageservers that predate this field simply report 0,
++    /// which disables load-based splitting for that shard.
++    #[serde(default)]
++    pub write_load_wps: u64,
+ }
+ 
+ #[derive(Serialize, Deserialize, Debug, Default)]
+--- a/pageserver/src/tenant.rs
++++ b/pageserver/src/tenant.rs
+@@ -4018,8 +4018,14 @@
+             physical_size: 0,
+             max_logical_size: 0,
+             max_logical_size_per_shard: 0,
++            write_load_wps: 0,
+         };
+ 
++        // [sovereign_core] Accumulate WAL records received across timelines to estimate
++        // this shard's write load, so the storage controller can drive load-based
++        // autosplits for small-but-hot tenants.
++        let mut wal_records_received: u64 = 0;
++
+         for timeline in self.timelines.lock().unwrap().values() {
+             result.resident_size += timeline.metrics.resident_physical_size_gauge.get();
+ 
+@@ -4032,8 +4038,17 @@
+                 result.max_logical_size,
+                 timeline.metrics.current_logical_size_gauge.get(),
+             );
++            wal_records_received =
++                wal_records_received.saturating_add(timeline.metrics.wal_records_received.get());
+         }
+ 
++        // [sovereign_core] Convert the cumulative WAL-record counter into an average
++        // requests/sec figure over this shard's lifetime. This is intentionally a coarse,
++        // monotonic estimate (no sampling window state is kept on the hot path); the storage
++        // controller only needs a stable signal to rank hot shards against a threshold.
++        let elapsed_secs = self.constructed_at.elapsed().as_secs().max(1);
++        result.write_load_wps = wal_records_received / elapsed_secs;
++
+         result.max_logical_size_per_shard = result
+             .max_logical_size
+             .div_ceil(self.tenant_shard_id.shard_count.count() as u64);
+--- a/pageserver/src/http/routes.rs
++++ b/pageserver/src/http/routes.rs
+@@ -3385,6 +3385,8 @@
+             TenantSorting::ResidentSize => sizes.resident_size,
+             TenantSorting::MaxLogicalSize => sizes.max_logical_size,
+             TenantSorting::MaxLogicalSizePerShard => sizes.max_logical_size_per_shard,
++            // [sovereign_core] Rank by observed write load for load-based autosplits.
++            TenantSorting::WriteLoad => sizes.write_load_wps,
+         }
+     }
+ 
