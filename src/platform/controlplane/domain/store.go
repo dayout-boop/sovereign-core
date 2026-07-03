@@ -130,6 +130,50 @@ func (s *Store) idempStore(key, id string) {
 	s.idemp[key] = id
 }
 
+// ── 원자적 멱등 예약(TOCTOU 제거) ──
+// idempReserve 는 "조회+선점"을 단일 잠금 구간에서 처리한다.
+//   - 이미 확정/예약된 키면: (기존값, reserved=false). 기존값이 ""(예약중)일 수 있음.
+//   - 미선점 키면: 이 요청이 자리 선점(sentinel "") 후 ("", reserved=true).
+// reserved=true 를 받은 요청만 실제 op 를 생성하고 idempCommit 으로 확정한다.
+// key=="" 인 경우(멱등키 미지정)는 항상 reserved=true(멱등성 미적용, 각자 진행).
+func (s *Store) idempReserve(key string) (existingID string, reserved bool) {
+	if key == "" {
+		return "", true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id, ok := s.idemp[key]; ok {
+		return id, false // 이미 선점됨(확정 id 또는 예약중 sentinel "")
+	}
+	s.idemp[key] = "" // sentinel = "예약됨, 확정 대기"
+	return "", true
+}
+
+// idempCommit — 예약한 요청이 op.ID 를 확정 기록.
+func (s *Store) idempCommit(key, id string) {
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idemp[key] = id
+}
+
+// idempResolve — 예약 실패한 요청이 확정된 op.ID 를 조회(폴링용).
+// ("", false) = 아직 확정 전(sentinel). (id, true) = 확정됨.
+func (s *Store) idempResolve(key string) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id, ok := s.idemp[key]
+	if !ok || id == "" {
+		return "", false
+	}
+	return id, true
+}
+
 // ── 비동기 op 완료 — 잠금 하에서만. (이전 레이스의 해소 지점) ──
 func (s *Store) completeOp(id string, result any) {
 	s.mu.Lock()
@@ -186,4 +230,15 @@ func (s *Store) transitionEndpoint(orgID, id, to string) error {
 	}
 	e.State = to
 	return nil
+}
+
+// getOrgRegion — org의 리전 반환. PGRouter 라우팅용.
+func (s *Store) getOrgRegion(orgID string) (region string, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	org, found := s.orgs[orgID]
+	if !found {
+		return "", false
+	}
+	return org.Region, true
 }

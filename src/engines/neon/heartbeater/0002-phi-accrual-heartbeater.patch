@@ -1,0 +1,135 @@
+--- heartbeater.rs.orig	2026-07-02 20:35:11.704942070 +0000
++++ heartbeater.rs	2026-07-02 20:51:27.854576826 +0000
+@@ -17,14 +17,26 @@
+ use utils::logging::SecretString;
+ 
+ use crate::node::Node;
++use crate::phi_accrual_detector::{DEFAULT_PHI_THRESHOLD, PhiAccrualDetector};
+ use crate::safekeeper::Safekeeper;
+ 
++// [sovereign_core] Suspicion threshold at which a node is declared Offline by the
++// adaptive phi-accrual detector. See phi_accrual_detector.rs for the model.
++const PHI_THRESHOLD: f64 = DEFAULT_PHI_THRESHOLD;
++
+ struct HeartbeaterTask<Server, State> {
+     receiver: tokio::sync::mpsc::UnboundedReceiver<HeartbeatRequest<Server, State>>,
+     cancel: CancellationToken,
+ 
+     state: HashMap<NodeId, State>,
+ 
++    // [sovereign_core] Per-node adaptive failure detectors. These learn each
++    // node's heartbeat rhythm and replace the single fixed `max_offline_interval`
++    // comparison when deciding to mark a node Offline. `max_offline_interval` is
++    // retained and passed to each detector as the cold-start fallback grace
++    // period, so behaviour before warm-up is identical to upstream.
++    detectors: HashMap<NodeId, PhiAccrualDetector>,
++
+     max_offline_interval: Duration,
+     max_warming_up_interval: Duration,
+     http_client: reqwest::Client,
+@@ -34,6 +46,10 @@
+ #[derive(Debug, Clone)]
+ pub(crate) enum PageserverState {
+     Available {
++        // [sovereign_core] Retained for observability/debug output. Failure
++        // detection no longer reads this directly; the adaptive phi-accrual
++        // detector (see phi_accrual_detector.rs) tracks heartbeat timing instead.
++        #[allow(dead_code)]
+         last_seen_at: Instant,
+         utilization: PageserverUtilization,
+     },
+@@ -132,6 +148,8 @@
+             receiver,
+             cancel,
+             state: HashMap::new(),
++            // [sovereign_core] detectors are created lazily per node on first heartbeat.
++            detectors: HashMap::new(),
+             max_offline_interval,
+             max_warming_up_interval,
+             http_client,
+@@ -271,14 +289,33 @@
+         let now = Instant::now();
+         for (node_id, ps_state) in new_state.iter_mut() {
+             use std::collections::hash_map::Entry::*;
++
++            // [sovereign_core] Feed the adaptive detector for this node. A
++            // successful heartbeat this round records an inter-arrival sample so
++            // the detector learns the node's rhythm; the detector is created
++            // lazily with `max_offline_interval` as its cold-start fallback grace.
++            let detector = self
++                .detectors
++                .entry(*node_id)
++                .or_insert_with(|| PhiAccrualDetector::new(self.max_offline_interval));
++            if let PageserverState::Available { .. } = ps_state {
++                detector.record_heartbeat(now);
++            }
++
+             let entry = self.state.entry(*node_id);
+ 
+             let mut needs_update = false;
+             match entry {
+                 Occupied(ref occ) => match (occ.get(), &ps_state) {
+                     (PageserverState::Offline, PageserverState::Offline) => {}
+-                    (PageserverState::Available { last_seen_at, .. }, PageserverState::Offline) => {
+-                        if now - *last_seen_at >= self.max_offline_interval {
++                    (PageserverState::Available { .. }, PageserverState::Offline) => {
++                        // [sovereign_core] Replace the fixed `max_offline_interval`
++                        // grace with the adaptive phi-accrual suspicion level. The
++                        // node is declared Offline only once suspicion crosses
++                        // PHI_THRESHOLD. Before enough samples are learned the
++                        // detector falls back to the old fixed grace, so early
++                        // behaviour is unchanged.
++                        if !detector.is_available(now, PHI_THRESHOLD) {
+                             deltas.push((*node_id, ps_state.clone()));
+                             needs_update = true;
+                         }
+@@ -313,6 +350,10 @@
+             }
+         }
+ 
++        // [sovereign_core] Drop detectors for nodes not present this round so the
++        // per-node detector map cannot grow unbounded as nodes are decommissioned.
++        self.detectors.retain(|id, _| new_state.contains_key(id));
++
+         Ok(AvailablityDeltas(deltas))
+     }
+ }
+@@ -409,14 +450,26 @@
+         let now = Instant::now();
+         for (node_id, sk_state) in new_state.iter_mut() {
+             use std::collections::hash_map::Entry::*;
++
++            // [sovereign_core] Safekeepers use the same adaptive detector as
++            // pageservers so quorum-affecting failures are surfaced promptly on
++            // steady links while jittery links keep their extra slack.
++            let detector = self
++                .detectors
++                .entry(*node_id)
++                .or_insert_with(|| PhiAccrualDetector::new(self.max_offline_interval));
++            if let SafekeeperState::Available { .. } = sk_state {
++                detector.record_heartbeat(now);
++            }
++
+             let entry = self.state.entry(*node_id);
+ 
+             let mut needs_update = false;
+             match entry {
+                 Occupied(ref occ) => match (occ.get(), &sk_state) {
+                     (SafekeeperState::Offline, SafekeeperState::Offline) => {}
+-                    (SafekeeperState::Available { last_seen_at, .. }, SafekeeperState::Offline) => {
+-                        if now - *last_seen_at >= self.max_offline_interval {
++                    (SafekeeperState::Available { .. }, SafekeeperState::Offline) => {
++                        if !detector.is_available(now, PHI_THRESHOLD) {
+                             deltas.push((*node_id, sk_state.clone()));
+                             needs_update = true;
+                         }
+@@ -443,6 +496,9 @@
+             }
+         }
+ 
++        // [sovereign_core] Same detector cleanup as the pageserver path.
++        self.detectors.retain(|id, _| new_state.contains_key(id));
++
+         Ok(AvailablityDeltas(deltas))
+     }
+ }
